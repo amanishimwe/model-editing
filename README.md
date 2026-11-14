@@ -20,7 +20,7 @@ This uses a tiny map, with no download. The norm oracle must undo the planted co
 
 ## M3 on a small model
 
-Default checkpoint is `Qwen/Qwen2.5-0.5B-Instruct`, which fits on this Mac. The same command takes any causal LM that has `mlp.down_proj.weight`.
+Default checkpoint is `Qwen/Qwen2.5-0.5B-Instruct`,. The same command takes any causal LM that has `mlp.down_proj.weight`.
 
 ```bash
 .venv/bin/python -m selfedit m3 --rounds 1 --conditions live,oracle,random,blind,no_edit
