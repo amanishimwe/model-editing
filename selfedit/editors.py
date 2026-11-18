@@ -126,10 +126,13 @@ def run_model(
     blind: bool,
     frozen: bool,
     allowed: set[str] | None = None,
+    system: str | None = None,
+    guide: bool = True,
+    free_layer: bool = False,
 ) -> Outcome:
     box = Toolbox(subject, gates, plant, blind=blind, allowed=allowed)
     scaffold = not blind and (allowed is None or "column_stats" in allowed)
-    messages = [{"role": "system", "content": SYSTEM}]
+    messages = [{"role": "system", "content": system or SYSTEM}]
     if scaffold:
         opened = box.call({"tool": "probes"})
         if box.journal:
@@ -149,12 +152,21 @@ def run_model(
     checksums: list[str] = []
     turns = 0
     chosen_layer: int | None = None
+    unparsed = 0
+    seen: set[tuple] = set()
+    stats_rows: list[dict] = []
     for _ in range(gates.max_turns):
         turns += 1
         checksums.append(subject.checksum())
         prefix = ""
-        if scaffold:
-            if chosen_layer is None:
+        if scaffold and guide:
+            if free_layer:
+                prefix = (
+                    '{"tool":"propose","column":'
+                    if chosen_layer is not None
+                    else '{"tool":"column_stats"}'
+                )
+            elif chosen_layer is None:
                 prefix = '{"tool":"column_stats","layer":'
             else:
                 prefix = '{"tool":"propose","layer":%d,"column":' % chosen_layer
@@ -165,31 +177,73 @@ def run_model(
             prefix=prefix,
         )
         messages.append({"role": "assistant", "content": raw})
-        if condition == "live":
-            print(f"  live raw: {raw[:180]!r}", flush=True)
+        if condition in ("live", "model"):
+            print(f"  {condition} raw: {raw[:180]!r}", flush=True)
         action = parse_action(raw)
         if action is None:
+            unparsed += 1
+            box.journal.append({"raw": raw[:500], "result": {"error": "unparsed"}})
+            if unparsed >= 2:
+                break
             messages.append(
                 {
                     "role": "user",
                     "content": "Finish that JSON with numbers from the tool result. Include column and factor.",
                 }
             )
-            box.journal.append({"raw": raw[:500], "result": {"error": "unparsed"}})
             continue
+        unparsed = 0
+        if action.get("tool") == "propose":
+            _fill_propose_layer(action, stats_rows)
+        signature = (
+            action.get("tool"),
+            action.get("layer"),
+            action.get("name"),
+            action.get("column"),
+            action.get("factor"),
+        )
+        if signature in seen:
+            break
+        seen.add(signature)
         result = box.call(action)
         if box.journal:
             box.journal[-1]["raw"] = raw[:500]
         messages.append({"role": "user", "content": _compact(result)})
         if action.get("tool") == "column_stats" and result.get("top"):
-            layer = action.get("layer")
-            if isinstance(layer, int):
-                chosen_layer = layer
-        if action.get("tool") == "propose":
+            layer = result.get("layer")
+            stats_rows = []
+            for row in result["top"]:
+                item = dict(row)
+                if item.get("layer") is None and layer is not None:
+                    item["layer"] = layer
+                stats_rows.append(item)
+            if free_layer:
+                chosen_layer = -1
+            elif isinstance(action.get("layer"), int):
+                chosen_layer = action["layer"]
+        if action.get("tool") == "propose" and not free_layer:
             chosen_layer = None
-        if action.get("tool") == "stop" or result.get("accepted"):
+        if action.get("tool") == "stop" or result.get("accepted") or box.proposals >= gates.max_proposals:
             break
     return _finish(condition, subject, box, turns, checksums)
+
+
+def _fill_propose_layer(action: dict, rows: list[dict]) -> None:
+    """A propose that names only a column inherits the layer of that column."""
+    if action.get("layer") is not None or isinstance(action.get("name"), str):
+        return
+    column = action.get("column")
+    matches = [row for row in rows if row.get("column") == column and row.get("layer") is not None]
+    if not matches:
+        return
+    factor = action.get("factor")
+    if factor is not None and len(matches) > 1:
+        matches.sort(
+            key=lambda row: abs(float(row.get("factor") or 0.0) - float(factor))
+            if row.get("factor") is not None
+            else 1e9
+        )
+    action["layer"] = matches[0]["layer"]
 
 
 def _compact(result: dict) -> str:
@@ -200,19 +254,23 @@ def _compact(result: dict) -> str:
             {"error": "same call", "say": "choose a different layer, or propose the column and factor you were just given"}
         )
     if result.get("top"):
-        top = result["top"][0]
-        norm = float(top["norm"])
-        median = float(result["median_norm"])
-        return json.dumps(
-            {
-                "layer": result.get("layer"),
-                "median_norm": result["median_norm"],
-                "column": top["column"],
-                "norm": top["norm"],
-                "z": top["z"],
-                "factor": round(median / norm, 4) if norm else None,
-            }
-        )
+        rows = []
+        for top in result["top"][:5]:
+            norm = float(top["norm"])
+            median = result.get("median_norm")
+            factor = top.get("factor")
+            if factor is None and median is not None and norm:
+                factor = round(float(median) / norm, 4)
+            rows.append(
+                {
+                    "layer": top.get("layer", result.get("layer")),
+                    "column": top["column"],
+                    "norm": top["norm"],
+                    "z": top["z"],
+                    "factor": factor,
+                }
+            )
+        return json.dumps({"top": rows, "say": "Propose the best row. Use its layer, column, and factor."})
     if "dev_failures" in result:
         return json.dumps(
             {
@@ -221,7 +279,7 @@ def _compact(result: dict) -> str:
                 "guard_correct": result.get("guard_correct"),
                 "guard_total": result.get("guard_total"),
                 "failures": result.get("dev_failures", [])[:4],
-                "say": "call column_stats with one layer number",
+                "say": "call column_stats with no layer, then propose one column",
             }
         )
     return json.dumps(result, ensure_ascii=True)

@@ -101,13 +101,29 @@ def _boundary(rows: list[dict], key: str) -> dict:
         below = max(scale for scale in misses if scale < min(hits))
         out["threshold"] = math.sqrt(below * min(hits))
         out["bound"] = "between"
-        return out
-    if hits:
+    elif hits:
         out["threshold"] = min(hits)
         out["bound"] = "at_or_below"
     elif misses or broken:
         out["threshold"] = max(misses or broken)
         out["bound"] = "above"
+    recoveries = []
+    for row in rows:
+        total = row.get("held_total") or 0
+        correct = row.get("held_correct")
+        if row["defect"] and total and correct is not None:
+            recoveries.append((row["scale"], correct / total))
+    passed = [scale for scale, rate in recoveries if rate >= 0.5]
+    failed = [scale for scale, rate in recoveries if rate < 0.5]
+    recovery: dict = {"threshold": None, "bound": None}
+    if passed and failed and any(scale < min(passed) for scale in failed):
+        below = max(scale for scale in failed if scale < min(passed))
+        recovery = {"threshold": math.sqrt(below * min(passed)), "bound": "between"}
+    elif passed:
+        recovery = {"threshold": min(passed), "bound": "at_or_below"}
+    elif failed:
+        recovery = {"threshold": max(failed), "bound": "above"}
+    out["recovery_50"] = recovery
     return out
 
 
@@ -298,6 +314,18 @@ def run_e4(
             flush=True,
         )
     lens = _logit_lens(subject, name, column)
+    weight = subject.param(name).detach().float().cpu()
+    column_vector = weight[:, column]
+    formats = {
+        "raw": {
+            "mean": round(float(column_vector.mean()), 4),
+            "std": round(float(column_vector.std(unbiased=False)), 4),
+            "norm": round(float(column_vector.norm()), 4),
+        },
+        "spectral_column_share": round(float(column_vector.norm() / weight.norm().clamp(min=1e-8)), 4),
+        "logit_lens": lens,
+        "live_format_sweep": "not_run",
+    }
     live_rows: dict[str, dict] = {}
     if live:
         live_gates = replace(gates, max_turns=8, max_new_tokens=128)
@@ -329,8 +357,83 @@ def run_e4(
         "column": {"name": name, "column": column},
         "scripted": scripted,
         "logit_lens_top_tokens": lens,
+        "formats": formats,
         "live": live_rows,
     }
+
+
+def _load_plant(model_id: str, device: str, subject=None):
+    """Load the checkpoint and find one selective column, then restore the clean weights."""
+    torch.set_grad_enabled(False)
+    gates = Gates()
+    if subject is None:
+        from selfedit.hf_subject import HFSubject
+
+        subject = HFSubject(model_id, device=device)
+        subject.origin = subject.clone_state()
+    else:
+        subject.load_state(subject.origin)
+    clean = subject.origin
+    plant = find_plant(subject, gates, banned=set())
+    if plant is None:
+        raise SystemExit("no selective column")
+    subject.load_state(clean)
+    return subject, gates, clean, plant
+
+
+def _save(prefix: str, report: dict, out_dir: Path | None) -> dict:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = out_dir or (ROOT / "runs" / f"{prefix}-{stamp}")
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def run_e3_only(
+    model_id: str = DEFAULT_MODEL,
+    device: str = "auto",
+    live: bool = True,
+    out_dir: Path | None = None,
+    subject=None,
+) -> dict:
+    subject, gates, clean, plant = _load_plant(model_id, device, subject)
+    e3 = run_e3(subject, gates, clean, plant.name, plant.column, live=live)
+    decision = _e3_text(e3)
+    print(decision, flush=True)
+    return _save(
+        "e3",
+        {"model": model_id, "experiment": "E3", "e3": e3, "decision": decision},
+        out_dir,
+    )
+
+
+def run_e4_only(
+    model_id: str = DEFAULT_MODEL,
+    device: str = "auto",
+    live: bool = True,
+    out_dir: Path | None = None,
+    subject=None,
+) -> dict:
+    """Run E4 on its own, at the scale the plant search found.
+
+    The combined e3e4 command instead uses the largest scale where the oracle succeeded.
+    """
+    subject, gates, clean, plant = _load_plant(model_id, device, subject)
+    e4 = run_e4(subject, gates, clean, plant.name, plant.column, plant.scale, live=live, seed=0)
+    decision = _e4_text(e4)
+    print(decision, flush=True)
+    return _save(
+        "e4",
+        {
+            "model": model_id,
+            "experiment": "E4",
+            "scale_source": "plant",
+            "e4": e4,
+            "decision": decision,
+        },
+        out_dir,
+    )
 
 
 def run_e3_e4(
@@ -339,38 +442,29 @@ def run_e3_e4(
     live: bool = True,
     out_dir: Path | None = None,
 ) -> dict:
-    torch.set_grad_enabled(False)
-    from selfedit.hf_subject import HFSubject
-
-    gates = Gates()
-    subject = HFSubject(model_id, device=device)
-    clean = subject.clone_state()
-    plant = find_plant(subject, gates, banned=set())
-    if plant is None:
-        raise SystemExit("no selective column, so E3 and E4 have nothing to sweep")
+    subject, gates, clean, plant = _load_plant(model_id, device)
     name, column = plant.name, plant.column
-    subject.load_state(clean)
     e3 = run_e3(subject, gates, clean, name, column, live=live)
     e4_scale = 4.0
     hits = [row["scale"] for row in e3["oracle"] if row["localized"]]
     if hits:
         e4_scale = max(hits)
     e4 = run_e4(subject, gates, clean, name, column, e4_scale, live=live, seed=0)
-    report = {
-        "model": model_id,
-        "e3": e3,
-        "e4": e4,
-        "e3_decision": _e3_text(e3),
-        "e4_decision": _e4_text(e4),
-    }
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    destination = out_dir or (ROOT / "runs" / f"e3-e4-{stamp}")
-    destination.mkdir(parents=True, exist_ok=True)
-    (destination / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(report["e3_decision"], flush=True)
-    print(report["e4_decision"], flush=True)
-    print(f"wrote {destination / 'report.json'}", flush=True)
-    return report
+    e3_decision = _e3_text(e3)
+    e4_decision = _e4_text(e4)
+    print(e3_decision, flush=True)
+    print(e4_decision, flush=True)
+    return _save(
+        "e3-e4",
+        {
+            "model": model_id,
+            "e3": e3,
+            "e4": e4,
+            "e3_decision": e3_decision,
+            "e4_decision": e4_decision,
+        },
+        out_dir,
+    )
 
 
 def _fmt_bound(bound: dict | None, label: str) -> str:
@@ -392,9 +486,16 @@ def _e3_text(e3: dict) -> str:
         if behavior
         else "Every tested scale that was scored had already changed held-out tokens."
     )
+    oracle_recovery = (e3["oracle_bound"].get("recovery_50") or {}).get("threshold")
+    recovery_text = (
+        f"The oracle 50% held-out recovery point is x{oracle_recovery:.2f}."
+        if oracle_recovery
+        else "The sweep did not yield a 50% held-out recovery point."
+    )
     return " ".join(
         [
             behavior_text,
+            recovery_text,
             _fmt_bound(e3["oracle_bound"], "The norm oracle"),
             _fmt_bound(e3.get("live_bound"), "The live model"),
         ]

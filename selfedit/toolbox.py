@@ -1,15 +1,12 @@
 """Tools the editor may call. The harness applies them and scores them."""
-
 from __future__ import annotations
-
 import json
 import re
-
 from selfedit.config import Gates
 from selfedit.plant import Plant
-from selfedit.subject import Subject
+from selfedit.subject import Subject, tensor_hash
 
-WEIGHT_TOOLS = {"column_stats", "column", "activations", "intervene"}
+WEIGHT_TOOLS = {"column_stats", "column", "activations", "intervene", "apply", "rollback"}
 
 
 class Toolbox:
@@ -33,6 +30,8 @@ class Toolbox:
         self.op: dict | None = None
         self.last_scores: dict = {}
         self.journal: list[dict] = []
+        self._saved_column: tuple | None = None
+        self._rejected: set[tuple[str, int]] = set()
 
     def call(self, action: dict) -> dict:
         tool = action.get("tool")
@@ -84,6 +83,14 @@ class Toolbox:
             return self._column(action)
         if tool == "activations":
             return self._activations(action)
+        if tool in ("apply", "intervene", "propose"):
+            blocked = _safety_block(action)
+            if blocked is not None:
+                return blocked
+        if tool == "apply":
+            return self._apply(action)
+        if tool == "rollback":
+            return self._rollback()
         if tool == "intervene":
             return self._scale(action, keep=False)
         if tool == "propose":
@@ -116,7 +123,7 @@ class Toolbox:
             "guard_total": guard_n,
             "heldout_hidden": len(self.subject.held),
             "layers": _layers(self.subject),
-            "next": "Call column_stats with a layer number. Then propose that layer, the top column, and factor = median_norm / norm.",
+            "next": "Call column_stats with no layer to rank every layer. Then propose one column and its factor.",
         }
 
     def _require_editable(self, action: dict) -> str | dict:
@@ -135,6 +142,8 @@ class Toolbox:
         return name
 
     def _column_stats(self, action: dict) -> dict:
+        if _as_int(action.get("layer")) is None and not isinstance(action.get("name"), str):
+            return self._global_column_stats()
         name = self._require_editable(action)
         if isinstance(name, dict):
             return name
@@ -163,6 +172,29 @@ class Toolbox:
             "std_norm": round(std, 4),
             "top": top,
         }
+
+    def _global_column_stats(self) -> dict:
+        ranked = []
+        for name in self.subject.editable_names():
+            norms = self.subject.column_norms(name)
+            std = float(norms.std(unbiased=False))
+            mean = float(norms.mean())
+            median = float(norms.median())
+            z = (norms - mean) / std if std > 0 else norms * 0
+            layer = _layer_of(name)
+            for column in z.abs().argsort(descending=True)[:1].tolist():
+                norm = float(norms[column])
+                ranked.append(
+                    {
+                        "layer": layer,
+                        "column": int(column),
+                        "norm": round(norm, 4),
+                        "z": round(float(z[column]), 4),
+                        "factor": round(median / norm, 4) if norm else None,
+                    }
+                )
+        ranked.sort(key=lambda row: abs(row["z"]), reverse=True)
+        return {"layers": "all", "top": ranked[: self.gates.top_norms]}
 
     def _column(self, action: dict) -> dict:
         name = self._require_editable(action)
@@ -199,6 +231,37 @@ class Toolbox:
             "top": [{"column": int(i), "activation": float(row[i])} for i in top_index],
         }
 
+    def _apply(self, action: dict) -> dict:
+        """Multiply one column by a known factor and leave the edit in place."""
+        name = self._require_editable(action)
+        if isinstance(name, dict):
+            return name
+        column = _as_int(action.get("column"))
+        factor = _as_float(action.get("factor"))
+        if column is None or factor is None:
+            return {"error": "column and factor are required"}
+        weight = self.subject.param(name)
+        if column < 0 or column >= weight.shape[1]:
+            return {"error": "column is out of range"}
+        self._saved_column = (name, column, weight.data[:, column].detach().clone())
+        self.subject.scale_column(name, column, factor)
+        return {
+            "applied": True,
+            "name": name,
+            "column": column,
+            "factor": factor,
+            "readback_hash": tensor_hash(weight.data),
+        }
+
+    def _rollback(self) -> dict:
+        """Put back the exact column bytes saved by the last apply."""
+        if self._saved_column is None:
+            return {"error": "nothing to roll back"}
+        name, column, saved = self._saved_column
+        _restore_column(self.subject, name, column, saved)
+        self._saved_column = None
+        return {"restored": True, "readback_hash": tensor_hash(self.subject.param(name).data)}
+
     def _scale(self, action: dict, keep: bool) -> dict:
         name = self._require_editable(action)
         if isinstance(name, dict):
@@ -214,6 +277,8 @@ class Toolbox:
         if budget >= limit:
             which = "proposals" if keep else "interventions"
             return {"error": f"{which} budget is spent"}
+        if keep and (name, column) in self._rejected:
+            return {"error": "That column was already rejected. Choose a different column."}
         try:
             saved = self.subject.param(name).data[:, column].detach().clone()
         except IndexError:
@@ -238,6 +303,8 @@ class Toolbox:
                 self.last_scores = scores
                 return scores
             _restore_column(self.subject, name, column, saved)
+            self._rejected.add((name, column))
+            scores["say"] = "Rejected. Choose a different column."
             self.last_scores = scores
             return scores
         self.interventions += 1
@@ -252,6 +319,14 @@ class Toolbox:
             "guard_correct": guard_correct,
             "guard_total": guard_n,
         }
+
+
+def _safety_block(action: dict) -> dict | None:
+    """Refuse an edit aimed at a safety-relevant component."""
+    name = action.get("name")
+    if action.get("component") == "safety" or (isinstance(name, str) and "safety" in name.lower()):
+        return {"error": "edits to safety-relevant components are blocked"}
+    return None
 
 
 def _restore_column(subject: Subject, name: str, column: int, saved) -> None:

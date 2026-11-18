@@ -53,13 +53,16 @@ class HFSubject(Subject):
         encoded = self.tokenizer(self.prompts, return_tensors="pt", padding=True)
         return {key: value.to(self.device) for key, value in encoded.items()}
 
-    def predict_map(self) -> list[int]:
+    def next_logits(self) -> torch.Tensor:
         encoded = self._encoded()
         with torch.inference_mode():
             logits = self.model(**encoded).logits
         lengths = encoded["attention_mask"].sum(dim=1) - 1
         index = torch.arange(lengths.shape[0], device=lengths.device)
-        return logits[index, lengths].argmax(dim=-1).tolist()
+        return logits[index, lengths].detach().cpu()
+
+    def predict_map(self) -> list[int]:
+        return self.next_logits().argmax(dim=-1).tolist()
 
     def activation_matrix(self, name: str) -> torch.Tensor:
         module_name = name.rsplit(".", 1)[0]

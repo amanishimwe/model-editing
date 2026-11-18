@@ -9,6 +9,11 @@ import torch
 import torch.nn as nn
 
 
+def tensor_hash(tensor: torch.Tensor) -> str:
+    blob = tensor.detach().cpu().contiguous()
+    return hashlib.sha256(blob.numpy().tobytes()).hexdigest()
+
+
 def _editable(name: str, param: torch.Tensor) -> bool:
     if param.ndim != 2:
         return False

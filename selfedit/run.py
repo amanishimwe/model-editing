@@ -1,9 +1,17 @@
-"""Run the harness self-test or a real M3 round."""
+"""
+Run SELF-EDIT experiments.
+
+Usage:
+    python -m selfedit run E1
+    python -m selfedit run E12
+    python -m selfedit run all
+"""
 
 from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,6 +98,134 @@ def run_selftest(out_dir: Path | None = None) -> dict:
     print(
         f"selftest passed: oracle localized the x{plant.scale:g} column, "
         f"random accepted {wins}/40, rollback restored the checksum",
+        flush=True,
+    )
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def _down_module(subject, name: str):
+    module_name = name.rsplit(".", 1)[0]
+    return dict(subject.model.named_modules())[module_name]
+
+
+def _capture_down(subject, name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One forward pass. Return next-token logits, the down-projection input, and its output."""
+    captured: dict[str, torch.Tensor] = {}
+
+    def hook(_module, args, output):
+        captured["x"] = args[0].detach()
+        captured["y"] = output.detach()
+
+    handle = _down_module(subject, name).register_forward_hook(hook)
+    try:
+        logits = subject.next_logits()
+    finally:
+        handle.remove()
+    return logits, captured["x"], captured["y"]
+
+
+def open_model(model_id: str = DEFAULT_MODEL, device: str = "auto"):
+    """Load the checkpoint once. Later experiments reuse this object."""
+    torch.set_grad_enabled(False)
+    from selfedit.hf_subject import HFSubject
+
+    subject = HFSubject(model_id, device=device)
+    subject.origin = subject.clone_state()
+    return subject
+
+
+def run_e1(
+    model_id: str = DEFAULT_MODEL,
+    device: str = "auto",
+    out_dir: Path | None = None,
+    column: int = 0,
+    delta: float = 2.0,
+    subject=None,
+) -> dict:
+    """Change one column by a known factor through the tool.
+
+    The down-projection output must equal the output predicted from that factor.
+    The hash of the parameter read back must equal the hash of the edited copy.
+    Rollback must restore bitwise-identical next-token logits.
+    """
+    torch.set_grad_enabled(False)
+    from selfedit.subject import tensor_hash
+
+    if subject is None:
+        subject = open_model(model_id, device)
+    else:
+        subject.load_state(subject.origin)
+    try:
+        return _run_e1_body(subject, model_id, out_dir, column, delta, tensor_hash)
+    finally:
+        subject.load_state(subject.origin)
+
+
+def _run_e1_body(subject, model_id, out_dir, column, delta, tensor_hash) -> dict:
+    name = subject.editable_names()[0]
+    clean_logits, clean_input, clean_output = _capture_down(subject, name)
+    weight = subject.param(name).detach()
+    edited = weight.clone()
+    edited[:, column].mul_(float(delta))
+    bias = _down_module(subject, name).bias
+    predicted = torch.nn.functional.linear(clean_input, edited.to(dtype=clean_input.dtype))
+    if bias is not None:
+        predicted = predicted + bias
+    if torch.equal(predicted, clean_output):
+        raise SystemExit(f"multiplying {name} column {column} by {delta:g} predicts no change")
+    expected_hash = tensor_hash(edited)
+    original_hash = tensor_hash(weight)
+
+    plant = Plant(name, column, delta, 0, [], [], [])
+    box = _toolbox(subject, Gates(), plant)
+    applied = box.call({"tool": "apply", "name": name, "column": column, "factor": delta})
+    readback_hash = tensor_hash(subject.param(name).data)
+    if applied.get("readback_hash") != expected_hash or readback_hash != expected_hash:
+        raise AssertionError("read-back hash does not match the known edit")
+
+    _edited_logits, edited_input, edited_output = _capture_down(subject, name)
+    if not torch.equal(edited_input, clean_input):
+        raise AssertionError("the edit changed the input of the layer it was applied to")
+    if not torch.equal(edited_output, predicted):
+        raise AssertionError("forward output does not match the prediction for this delta")
+
+    restored = box.call({"tool": "rollback"})
+    if restored.get("readback_hash") != original_hash or tensor_hash(subject.param(name).data) != original_hash:
+        raise AssertionError("rollback did not restore the parameter bytes")
+    if not torch.equal(subject.next_logits(), clean_logits):
+        raise AssertionError("rollback did not restore bitwise-identical logits")
+
+    report = {
+        "stage": "e1",
+        "model": model_id,
+        "device": str(subject.device),
+        "dtype": subject.dtype,
+        "parameter": name,
+        "column": column,
+        "delta": delta,
+        "applied_through_tool": True,
+        "forward_matches_prediction": True,
+        "expected_hash": expected_hash,
+        "readback_hash": readback_hash,
+        "readback_hash_matches": True,
+        "rollback_hash": original_hash,
+        "rollback_logits_identical": True,
+        "runtimes": {
+            "this_harness": "passed",
+            "production": {
+                "status": "not_run",
+                "reason": "No second runtime is configured.",
+            },
+        },
+    }
+    destination = out_dir or (ROOT / "runs" / "e1")
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        f"E1 passed on {model_id}: {name} column {column} x{delta:g} through the tool, "
+        f"forward matched the prediction, read-back hash matched, "
+        f"rollback restored the logits",
         flush=True,
     )
     print(f"wrote {destination / 'report.json'}", flush=True)
@@ -294,37 +430,166 @@ def _decision(summary: dict) -> str:
     return " ".join(lines)
 
 
+def experiment_key(name: str) -> str:
+    """Accept E12, e12, or 12. Return E12. 'all' is returned as ALL."""
+    text = name.strip().upper()
+    if text == "ALL":
+        return "ALL"
+    number = text[1:] if text.startswith("E") else text
+    if number.isdigit() and 1 <= int(number) <= 37:
+        return f"E{int(number)}"
+    raise SystemExit(f"unknown experiment: {name}. Use E1 through E37, or all.")
+
+
+def _stamp_dir(key: str) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return ROOT / "runs" / f"{key.lower()}-{stamp}"
+
+
+def dispatch(
+    name: str | list[str],
+    model: str = DEFAULT_MODEL,
+    device: str = "auto",
+    out_dir: Path | None = None,
+    live: bool = True,
+    rounds: int = 3,
+) -> None:
+    names = [name] if isinstance(name, str) else list(name)
+    keys = [experiment_key(item) for item in names]
+    if "ALL" in keys:
+        run_all(model=model, device=device, out_dir=out_dir, live=live, rounds=rounds)
+        return
+    subject = None
+    if len(keys) > 1:
+        print(f"loading {model} once for {', '.join(keys)}", flush=True)
+        subject = open_model(model, device)
+    for key in keys:
+        destination = out_dir if len(keys) == 1 else (out_dir / key if out_dir else _stamp_dir(key))
+        if out_dir is not None and len(keys) > 1:
+            destination = out_dir / key
+        print(f"=== {key} ===", flush=True)
+        _run_key(key, model=model, device=device, out_dir=destination, live=live, subject=subject)
+        if subject is not None:
+            subject.load_state(subject.origin)
+
+
+def _run_key(key, model, device, out_dir, live, subject) -> None:
+    if key == "E1":
+        run_e1(model_id=model, device=device, out_dir=out_dir, subject=subject)
+        return
+    if key == "E2":
+        from selfedit.e2 import run_e2
+
+        run_e2(model_id=model, device=device, out_dir=out_dir, live=live, subject=subject)
+        return
+    if key == "E3":
+        from selfedit.ladder import run_e3_only
+
+        run_e3_only(model_id=model, device=device, live=live, out_dir=out_dir, subject=subject)
+        return
+    if key == "E4":
+        from selfedit.ladder import run_e4_only
+
+        run_e4_only(model_id=model, device=device, live=live, out_dir=out_dir, subject=subject)
+        return
+    from selfedit.programme import run_programme
+
+    run_programme(model_id=model, device=device, out_dir=out_dir, only=(key,), subject=subject)
+
+
+def run_all(
+    model: str = DEFAULT_MODEL,
+    device: str = "auto",
+    out_dir: Path | None = None,
+    live: bool = True,
+    rounds: int = 3,
+) -> None:
+    """Run E1 through E37 in this process. The checkpoint is loaded once."""
+    del rounds
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = out_dir or (ROOT / "runs" / f"all-{stamp}")
+    root.mkdir(parents=True, exist_ok=True)
+    print(f"loading {model} once", flush=True)
+    subject = open_model(model, device)
+    status_path = root / "status.tsv"
+    with status_path.open("w") as status:
+        status.write("experiment\texit\tseconds\n")
+        for number in range(1, 38):
+            key = f"E{number}"
+            folder = root / f"E{number:02d}"
+            folder.mkdir(parents=True, exist_ok=True)
+            print(f"=== {key} ===", flush=True)
+            started = time.monotonic()
+            code = 0
+            try:
+                _run_key(key, model=model, device=device, out_dir=folder, live=live, subject=subject)
+            except Exception as exc:
+                code = 1
+                print(f"    error: {type(exc).__name__}: {exc}", flush=True)
+            finally:
+                subject.load_state(subject.origin)
+            elapsed = round(time.monotonic() - started)
+            status.write(f"{key}\t{code}\t{elapsed}\n")
+            status.flush()
+            print(f"    exit {code} in {elapsed}s", flush=True)
+    print(f"status: {status_path}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="SELF-EDIT controlled self-repair experiment")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    selftest = sub.add_parser("selftest", help="check the harness on a tiny map")
+    run = sub.add_parser("run", help="run one experiment (E1-E37) or all of them")
+    run.add_argument("experiment", nargs="+", help="one or more of E1 through E37, or all")
+    run.add_argument("--model", default=DEFAULT_MODEL)
+    run.add_argument("--device", default="auto")
+    run.add_argument("--rounds", type=int, default=3, help="E2 only: planted rounds")
+    run.add_argument("--no-live", action="store_true", help="E3 and E4 only: skip the live model")
+    run.add_argument("--out", type=Path, default=None)
+    selftest = sub.add_parser("selftest", help="check the harness on a tiny map (same as run E1)")
     selftest.add_argument("--out", type=Path, default=None)
-    m3 = sub.add_parser("m3", help="plant a scaled column inside a live language model")
+    m3 = sub.add_parser("m3", help="plant a scaled column inside a live language model (same as run E2)")
     m3.add_argument("--model", default=DEFAULT_MODEL)
     m3.add_argument("--rounds", type=int, default=3)
     m3.add_argument("--seed", type=int, default=0)
     m3.add_argument("--device", default="auto")
     m3.add_argument("--conditions", default=",".join(CONDITIONS))
     m3.add_argument("--out", type=Path, default=None)
-    sweep = sub.add_parser("e3e4", help="run the E3 staircase and the E4 information ladder")
+    sweep = sub.add_parser("e3e4", help="run E3 and E4 together, with E4 using E3's scale")
     sweep.add_argument("--model", default=DEFAULT_MODEL)
     sweep.add_argument("--device", default="auto")
     sweep.add_argument("--no-live", action="store_true")
     sweep.add_argument("--out", type=Path, default=None)
-    programme = sub.add_parser("programme", help="run E5 through E37")
+    programme = sub.add_parser("programme", help="run E5 through E37 in one process")
     programme.add_argument("--model", default=DEFAULT_MODEL)
     programme.add_argument("--device", default="auto")
     programme.add_argument("--out", type=Path, default=None)
+    programme.add_argument("--only", default=None, help="comma-separated experiments, for example E6,E12")
     args = parser.parse_args(argv)
+    if args.cmd == "run":
+        try:
+            dispatch(
+                args.experiment,
+                model=args.model,
+                device=args.device,
+                out_dir=args.out,
+                live=not args.no_live,
+                rounds=args.rounds,
+            )
+        except KeyboardInterrupt:
+            sys.exit(130)
+        return
     if args.cmd == "selftest":
         run_selftest(args.out)
         return
     if args.cmd == "programme":
         from selfedit.programme import run_programme
 
-        run_programme(model_id=args.model, device=args.device, out_dir=args.out)
+        only = None
+        if args.only:
+            only = tuple(part.strip() for part in args.only.split(",") if part.strip())
+        run_programme(model_id=args.model, device=args.device, out_dir=args.out, only=only)
         return
     if args.cmd == "e3e4":
         from selfedit.ladder import run_e3_e4

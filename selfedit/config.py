@@ -7,9 +7,7 @@ measure. Held-out prompts and guard prompts must all match the tokens
 recorded before the plant. Diagnostic prompts may be shown to the editor.
 Held-out prompt text may not.
 """
-
 from __future__ import annotations
-
 from dataclasses import asdict, dataclass
 
 
