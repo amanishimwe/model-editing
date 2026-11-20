@@ -129,6 +129,11 @@ def run_model(
     system: str | None = None,
     guide: bool = True,
     free_layer: bool = False,
+    shown_rows: int = 5,
+    reverse_rows: bool = False,
+    row_order: tuple[int, ...] | None = None,
+    say: str | None = None,
+    prior: list[dict] | None = None,
 ) -> Outcome:
     box = Toolbox(subject, gates, plant, blind=blind, allowed=allowed)
     scaffold = not blind and (allowed is None or "column_stats" in allowed)
@@ -137,7 +142,9 @@ def run_model(
         opened = box.call({"tool": "probes"})
         if box.journal:
             box.journal[-1]["by"] = "harness"
-        messages.append({"role": "user", "content": _compact(opened)})
+        messages.append({"role": "user", "content": _compact(opened, shown_rows)})
+        if prior:
+            messages.extend(prior)
     else:
         messages.append(
             {
@@ -206,9 +213,29 @@ def run_model(
             break
         seen.add(signature)
         result = box.call(action)
+        if condition in ("live", "model") and action.get("tool") == "column_stats":
+            shown = _compact(
+                result,
+                shown_rows,
+                reverse_rows,
+                row_order if action.get("tool") == "column_stats" else None,
+                say,
+            )
+            print(f"  {condition} stats: {shown[:1200]}", flush=True)
         if box.journal:
             box.journal[-1]["raw"] = raw[:500]
-        messages.append({"role": "user", "content": _compact(result)})
+        messages.append(
+            {
+                "role": "user",
+                "content": _compact(
+                    result,
+                    shown_rows,
+                    reverse_rows and action.get("tool") == "column_stats",
+                    row_order if action.get("tool") == "column_stats" else None,
+                    say if action.get("tool") == "column_stats" else None,
+                ),
+            }
+        )
         if action.get("tool") == "column_stats" and result.get("top"):
             layer = result.get("layer")
             stats_rows = []
@@ -246,7 +273,13 @@ def _fill_propose_layer(action: dict, rows: list[dict]) -> None:
     action["layer"] = matches[0]["layer"]
 
 
-def _compact(result: dict) -> str:
+def _compact(
+    result: dict,
+    stats_rows: int = 5,
+    reverse_rows: bool = False,
+    row_order: tuple[int, ...] | None = None,
+    say: str | None = None,
+) -> str:
     import json
 
     if result.get("note") and result.get("top"):
@@ -255,7 +288,7 @@ def _compact(result: dict) -> str:
         )
     if result.get("top"):
         rows = []
-        for top in result["top"][:5]:
+        for top in result["top"][:stats_rows]:
             norm = float(top["norm"])
             median = result.get("median_norm")
             factor = top.get("factor")
@@ -270,7 +303,12 @@ def _compact(result: dict) -> str:
                     "factor": factor,
                 }
             )
-        return json.dumps({"top": rows, "say": "Propose the best row. Use its layer, column, and factor."})
+        if row_order:
+            rows = [rows[index] for index in row_order]
+        elif reverse_rows:
+            rows.reverse()
+        instruction = say or "Propose the best row. Use its layer, column, and factor."
+        return json.dumps({"top": rows, "say": instruction})
     if "dev_failures" in result:
         return json.dumps(
             {

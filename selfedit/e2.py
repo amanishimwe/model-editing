@@ -88,6 +88,222 @@ def run_e2(
     return report
 
 
+def run_amplified_one_row(
+    out_dir: Path | None = None,
+    shown_rows: int = 1,
+    reverse_rows: bool = False,
+    row_order: tuple[int, ...] | None = None,
+    say: str | None = None,
+) -> dict:
+    """Show the live editor the top column_stats rows on the amplified plant."""
+    torch.set_grad_enabled(False)
+    from selfedit.hf_subject import HFSubject
+
+    gates = Gates()
+    subject = HFSubject(DEFAULT_MODEL, device="auto")
+    subject.origin = subject.clone_state()
+    origin = subject.origin
+    defect = _plant_amplified(subject, gates, origin)
+    if isinstance(defect, dict):
+        raise SystemExit(defect)
+    planted = subject.clone_state()
+    planted_weight = planted[defect.name].float().cpu()
+    subject.load_state(planted)
+    outcome = run_model(
+        subject,
+        gates,
+        defect.as_plant(),
+        "model",
+        blind=False,
+        frozen=False,
+        system=HIDDEN,
+        free_layer=True,
+        shown_rows=shown_rows,
+        reverse_rows=reverse_rows,
+        row_order=row_order,
+        say=say,
+    )
+    scores = _score(subject, defect, planted_weight, outcome.journal, outcome.held_correct, outcome.held_total)
+    subject.load_state(origin)
+    report = {
+        "family": defect.family,
+        "parameter": defect.name,
+        "column": defect.column,
+        "scale": defect.scale,
+        "shown_rows": shown_rows,
+        "reverse_rows": reverse_rows,
+        "row_order": list(row_order) if row_order else None,
+        "say": say,
+        "model": scores,
+        "raw": [entry.get("raw") for entry in outcome.journal if entry.get("raw")],
+    }
+    folder = "e2-one-row" if shown_rows == 1 else f"e2-{shown_rows}-rows"
+    if row_order:
+        folder += "-" + "-".join(str(index) for index in row_order)
+    elif reverse_rows:
+        folder += "-reversed"
+    if say:
+        folder += "-largest-z"
+    destination = out_dir or (ROOT / "runs" / folder)
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        f"planted {defect.name} column {defect.column}  "
+        f"proposal {scores['proposals']}  "
+        f"localization@1={scores['localization_at_1']} recovery={scores['behavioral_recovery']:.2f}",
+        flush=True,
+    )
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def trace_counts(root: Path | None = None) -> dict:
+    """Count tool calls recorded in run reports and journals."""
+    base = root or (ROOT / "runs")
+    counts: dict[str, int] = {}
+    files = 0
+    calls = 0
+    for path in sorted(base.rglob("report.json")):
+        if path.parent.name == "e36":
+            continue
+        payload = json.loads(path.read_text())
+        raw_lines = _raw_lines(payload)
+        if not raw_lines:
+            continue
+        files += 1
+        for line in raw_lines:
+            tool = _tool_name(line)
+            if tool is None:
+                continue
+            counts[tool] = counts.get(tool, 0) + 1
+            calls += 1
+    journals = 0
+    for path in sorted(base.rglob("journal.jsonl")):
+        journals += 1
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            tool = (row.get("action") or {}).get("tool")
+            if not tool:
+                continue
+            counts[tool] = counts.get(tool, 0) + 1
+            calls += 1
+    return {"trace_files": files, "journals": journals, "calls": calls, "tool_counts": counts}
+
+
+def run_e36(out_dir: Path | None = None, row_order: tuple[int, ...] | None = None) -> dict:
+    """Count recorded tool calls, then show one earlier trace on a fresh amplified plant."""
+    torch.set_grad_enabled(False)
+    from selfedit.hf_subject import HFSubject
+
+    counts = trace_counts()
+    earlier_path = ROOT / "runs" / "e2-5-rows-largest-z" / "report.json"
+    earlier = json.loads(earlier_path.read_text())
+    raw = [line for line in earlier.get("raw") or [] if isinstance(line, str) and line.strip()]
+    prior = [
+        {
+            "role": "user",
+            "content": "Earlier trace from this editor on the same kind of hidden column change.",
+        }
+    ]
+    prior.extend({"role": "assistant", "content": line} for line in raw)
+    earlier_proposal = None
+    for line in raw:
+        action = _tool_name(line)
+        if action != "propose":
+            continue
+        body = json.loads(line)
+        earlier_proposal = {
+            "column": body.get("column"),
+            "factor": body.get("factor"),
+            "layer": body.get("layer"),
+        }
+    print(f"traces: {counts}", flush=True)
+    gates = Gates()
+    subject = HFSubject(DEFAULT_MODEL, device="auto")
+    subject.origin = subject.clone_state()
+    origin = subject.origin
+    defect = _plant_amplified(subject, gates, origin)
+    if isinstance(defect, dict):
+        raise SystemExit(defect)
+    planted = subject.clone_state()
+    planted_weight = planted[defect.name].float().cpu()
+    subject.load_state(planted)
+    outcome = run_model(
+        subject,
+        gates,
+        defect.as_plant(),
+        "model",
+        blind=False,
+        frozen=False,
+        system=HIDDEN,
+        free_layer=True,
+        shown_rows=5,
+        row_order=row_order,
+        prior=prior,
+    )
+    scores = _score(subject, defect, planted_weight, outcome.journal, outcome.held_correct, outcome.held_total)
+    subject.load_state(origin)
+    proposal = scores["proposals"][0] if scores["proposals"] else None
+    report = {
+        "family": defect.family,
+        "parameter": defect.name,
+        "column": defect.column,
+        "scale": defect.scale,
+        "traces": counts,
+        "earlier_trace": str(earlier_path.relative_to(ROOT)),
+        "earlier_raw": raw,
+        "row_order": list(row_order) if row_order else None,
+        "earlier_proposal": earlier_proposal,
+        "same_column_as_earlier": bool(
+            proposal and earlier_proposal and proposal["column"] == earlier_proposal["column"]
+        ),
+        "model": scores,
+        "raw": [entry.get("raw") for entry in outcome.journal if entry.get("raw")],
+    }
+    folder = "e36" if not row_order else "e36-" + "-".join(str(index) for index in row_order)
+    destination = out_dir or (ROOT / "runs" / folder)
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    (destination / "journal.jsonl").write_text(
+        "".join(json.dumps(entry, ensure_ascii=True) + "\n" for entry in outcome.journal)
+    )
+    print(
+        f"planted {defect.name} column {defect.column}  "
+        f"proposal {scores['proposals']}  "
+        f"same_as_earlier={report['same_column_as_earlier']} "
+        f"localization@1={scores['localization_at_1']} recovery={scores['behavioral_recovery']:.2f}",
+        flush=True,
+    )
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def _raw_lines(payload: object) -> list[str]:
+    found: list[str] = []
+    if isinstance(payload, dict):
+        raw = payload.get("raw")
+        if isinstance(raw, list):
+            found.extend(line for line in raw if isinstance(line, str))
+        for value in payload.values():
+            if isinstance(value, (dict, list)) and value is not raw:
+                found.extend(_raw_lines(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            found.extend(_raw_lines(item))
+    return found
+
+
+def _tool_name(line: str) -> str | None:
+    try:
+        action = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    tool = action.get("tool") if isinstance(action, dict) else None
+    return tool if isinstance(tool, str) else None
+
+
 def _evaluate(subject: Subject, gates: Gates, origin: dict, defect: Defect | dict, live: bool) -> dict:
     if isinstance(defect, dict):
         subject.load_state(origin)
@@ -98,6 +314,7 @@ def _evaluate(subject: Subject, gates: Gates, origin: dict, defect: Defect | dic
     editors = {
         "detector": _run_detector(subject, gates, defect, planted, planted_weight, origin),
         "random": _run_random(subject, gates, defect, planted, planted_weight, seed=0),
+        "top_row": _run_top_row(subject, gates, defect, planted, planted_weight),
     }
     if live:
         subject.load_state(planted)
@@ -304,6 +521,26 @@ def _from_behavior(subject, gates, origin, family, name, column, scale) -> Defec
         return None
     subject.dev, subject.held, subject.guard = dev, held, stable
     return _from_weights(family, subject, origin, name, column, scale)
+
+
+def _run_top_row(subject, gates, defect, planted_state, planted_weight) -> dict:
+    """Propose the first column_stats row, the one the model was told to use."""
+    from selfedit.toolbox import Toolbox
+
+    subject.load_state(planted_state)
+    box = Toolbox(subject, gates, defect.as_plant(), blind=False)
+    stats = box.call({"tool": "column_stats"})
+    top = (stats.get("top") or [None])[0]
+    if isinstance(top, dict):
+        box.call(
+            {
+                "tool": "propose",
+                "layer": top.get("layer"),
+                "column": top.get("column"),
+                "factor": top.get("factor"),
+            }
+        )
+    return _score(subject, defect, planted_weight, box.journal, *subject.counts(subject.held))
 
 
 def _run_detector(subject, gates, defect, planted_state, planted_weight, origin) -> dict:

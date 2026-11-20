@@ -291,9 +291,94 @@ class Ctx:
             ),
         }
 
-    def e7(self) -> dict:
+    def e6_repair_rings(self) -> dict:
+        """Score the accepted undo on the rephrases and the other-domain prompts."""
+        name, column, scale = self.anchor["name"], self.anchor["column"], self.anchor["scale"]
+        flipped = [self.subject.prompts[i] for i in self.anchor["flipped"][:4]]
+        rephrased = [PARAPHRASES[prompt] for prompt in flipped if prompt in PARAPHRASES]
+        other = ["def add(a, b):", "The chemical symbol for water is", "Once upon a time"]
+        self.subject.load_state(self.clean)
+        clean = {prompt: self._token(prompt) for prompt in rephrased + other}
+        with self._scaled(name, column, scale):
+            planted = {prompt: self._token(prompt) for prompt in clean}
+            self.subject.scale_column(name, column, 1.0 / scale)
+            repaired = {prompt: self._token(prompt) for prompt in clean}
+        def rows(prompts: list[str]) -> list[dict]:
+            return [
+                {
+                    "prompt": prompt,
+                    "clean": self._text(clean[prompt]),
+                    "planted": self._text(planted[prompt]),
+                    "repaired": self._text(repaired[prompt]),
+                    "plant_moved": planted[prompt] != clean[prompt],
+                    "repair_moved": repaired[prompt] != clean[prompt],
+                }
+                for prompt in prompts
+            ]
+        rephrase_rows = rows(rephrased)
+        other_rows = rows(other)
+        repair_rephrase = sum(row["repair_moved"] for row in rephrase_rows)
+        repair_other = sum(row["repair_moved"] for row in other_rows)
+        return {
+            "status": "ran",
+            "parameter": name,
+            "column": column,
+            "scale": scale,
+            "rephrased": rephrase_rows,
+            "other_domain": other_rows,
+            "repair_moved_rephrased": repair_rephrase,
+            "repair_moved_other_domain": repair_other,
+            "finding": (
+                f"The accepted undo moves {repair_rephrase}/{len(rephrase_rows)} rephrases "
+                f"and {repair_other}/{len(other_rows)} other-domain prompts off the clean next token."
+            ),
+        }
+
+    def e6_french(self) -> dict:
+        """Score the accepted undo on the four flipped facts in French."""
+        name, column, scale = self.anchor["name"], self.anchor["column"], self.anchor["scale"]
+        prompts = [
+            "La capitale du Japon est",
+            "La plus grande planète est",
+            "L'herbe a la couleur",
+            "Les oiseaux volent à travers",
+        ]
+        self.subject.load_state(self.clean)
+        clean = {prompt: self._token(prompt) for prompt in prompts}
+        with self._scaled(name, column, scale):
+            planted = {prompt: self._token(prompt) for prompt in prompts}
+            self.subject.scale_column(name, column, 1.0 / scale)
+            repaired = {prompt: self._token(prompt) for prompt in prompts}
+        rows = [
+            {
+                "prompt": prompt,
+                "clean": self._text(clean[prompt]),
+                "planted": self._text(planted[prompt]),
+                "repaired": self._text(repaired[prompt]),
+                "plant_moved": planted[prompt] != clean[prompt],
+                "repair_moved": repaired[prompt] != clean[prompt],
+            }
+            for prompt in prompts
+        ]
+        plant_moved = sum(row["plant_moved"] for row in rows)
+        repair_moved = sum(row["repair_moved"] for row in rows)
+        return {
+            "status": "ran",
+            "parameter": name,
+            "column": column,
+            "scale": scale,
+            "french": rows,
+            "plant_moved": plant_moved,
+            "repair_moved": repair_moved,
+            "finding": (
+                f"The planted column moves {plant_moved}/{len(rows)} French prompts. "
+                f"The accepted undo moves {repair_moved}/{len(rows)} off the clean next token."
+            ),
+        }
+
+    def e7(self, edits: int = 128) -> dict:
         target = 1000
-        effects = self._effect_sample(128)
+        effects = self._effect_sample(edits)
         if not effects:
             return {"status": "ran", "finding": "No random edit changed a prompt."}
         matrix = torch.tensor([row["mask"] for row in effects], dtype=torch.float32)
@@ -310,7 +395,7 @@ class Ctx:
             "edits": len(effects),
             "components_for_90_percent": n90,
             "singular_values_top": [round(float(v), 3) for v in singular[:8]],
-            "reason": "The document asks for thousands of random edits. This run uses 128.",
+            "reason": f"The document asks for thousands of random edits. This run uses {len(effects)}.",
             "finding": (
                 f"{n90} components cover 90% of the prompt-change patterns "
                 f"across {len(effects)} random column scales."
@@ -318,11 +403,46 @@ class Ctx:
         }
 
     def e8(self) -> dict:
+        """Classify the accepted column undo as a content repair or an obstruction."""
+        name, column, scale = self.anchor["name"], self.anchor["column"], self.anchor["scale"]
+        indexes = self.anchor["flipped"]
+        self.subject.load_state(self.clean)
+        clean = self._count_state(indexes)
+        with self._scaled(name, column, scale):
+            planted = self._count_state(indexes)
+            self.subject.scale_column(name, column, 1.0 / scale)
+            repaired = self._count_state(indexes)
+        if clean["loops"]:
+            kind = "loop already in the clean model"
+        elif repaired["loops"] and repaired["correct"] == len(indexes):
+            kind = "obstruction on a content repair"
+        elif (not repaired["loops"]) and repaired["correct"] == len(indexes):
+            kind = "content repair"
+        else:
+            kind = "unclassified"
+        return {
+            "status": "ran",
+            "parameter": name,
+            "column": column,
+            "scale": scale,
+            "clean": clean,
+            "planted": planted,
+            "repaired": repaired,
+            "classification": kind,
+            "finding": (
+                f"Clean count loops={clean['loops']} and keeps {clean['correct']}/{len(indexes)} prompts. "
+                f"Planted count loops={planted['loops']} and keeps {planted['correct']}/{len(indexes)}. "
+                f"The accepted undo loops={repaired['loops']} and restores {repaired['correct']}/{len(indexes)}. "
+                f"Classification: {kind}."
+            ),
+        }
+
+    def _count_state(self, indexes: list[int]) -> dict:
         reply = self._ask("Count slowly from 1 to 30.", max_new_tokens=180)
         return {
-            "status": "not_run",
-            "reason": "No accepted self-edit was available to classify as obstruction or content.",
-            "generation_loops": _repeats(reply),
+            "loops": _repeats(reply),
+            "correct": self._match(indexes),
+            "reply": reply[:500],
         }
 
     def e9(self) -> dict:
@@ -596,7 +716,7 @@ class Ctx:
             "finding": f"No-defect reply was {quiet_choice}. Diffuse-change reply was {diffuse_choice}.",
         }
 
-    def e17(self) -> dict:
+    def e17(self, probe_count: int = 20) -> dict:
         layer = _layer_number(self.anchor["name"])
         reply = self._ask(
             "A hidden column scale broke some next tokens. "
@@ -611,7 +731,7 @@ class Ctx:
         else:
             named_layer, named_column = numbers[0], numbers[1]
             forecast = "named" if named_column == self.anchor["column"] and named_layer == layer else "missed"
-        probes = list(enumerate(self.subject.prompts[:20]))
+        probes = list(enumerate(self.subject.prompts[:probe_count]))
         probe_reply = self._ask(
             "Which of these prompt numbers change under the planted column? Reply with integers only.\n"
             + "\n".join(f"{index}. {prompt[:48]}" for index, prompt in probes),
@@ -936,9 +1056,60 @@ class Ctx:
         }
 
     def e27(self) -> dict:
+        from selfedit.e2 import Defect, _plant_rank_one, _plant_suppressed
+        from selfedit.editors import run_model
+
+        rows = getattr(self, "turn_rows", None) or []
+        accepted = [row for row in rows if row.get("accepted")]
+        if not accepted:
+            return {
+                "status": "not_run",
+                "reason": "The loop did not accept an edit, so its score on a hidden defect family was not used as the objective.",
+                "accepted_repairs": 0,
+            }
+        anchor = (self.anchor["name"], self.anchor["column"])
+        hidden = _plant_suppressed(
+            self.subject, self.gates, self.clean, {"family": "amplified-direction"}
+        )
+        if not isinstance(hidden, Defect) or (hidden.name, hidden.column) == anchor:
+            hidden = _plant_rank_one(self.subject, self.gates, self.clean)
+        if not isinstance(hidden, Defect) or (hidden.name, hidden.column) == anchor:
+            self.subject.load_state(self.clean)
+            return {
+                "status": "not_run",
+                "reason": "No hidden defect family could be planted away from the amplified column.",
+                "accepted_repairs": len(accepted),
+                "plant": hidden if isinstance(hidden, dict) else None,
+            }
+        outcome = run_model(
+            self.subject,
+            self.gates,
+            hidden.as_plant(),
+            "hidden-family",
+            blind=False,
+            frozen=False,
+        )
+        self.subject.load_state(self.clean)
+        recovery = outcome.held_correct / outcome.held_total if outcome.held_total else None
         return {
-            "status": "not_run",
-            "reason": "The loop did not accept an edit, so its score on a hidden defect family was not used as the objective.",
+            "status": "ran",
+            "accepted_repairs": len(accepted),
+            "family": hidden.family,
+            "parameter": hidden.name,
+            "column": hidden.column,
+            "scale": hidden.scale,
+            "editor_accepted": outcome.accepted,
+            "editor_localized": outcome.localized,
+            "held_correct": outcome.held_correct,
+            "held_total": outcome.held_total,
+            "behavioral_recovery": recovery,
+            "finding": (
+                f"E25 accepted {len(accepted)} repairs on the amplified column. "
+                f"The same editor on hidden family {hidden.family} "
+                f"({hidden.name} column {hidden.column} ×{hidden.scale:g}) "
+                f"accepted={outcome.accepted}, localized={outcome.localized}, "
+                f"held {outcome.held_correct}/{outcome.held_total}."
+            ),
         }
 
     def e28(self) -> dict:
@@ -1107,7 +1278,12 @@ class Ctx:
         from selfedit.plant import Plant
         from selfedit.toolbox import Toolbox
 
-        box = Toolbox(self.subject, self.gates, Plant(self.anchor["name"], self.anchor["column"], self.anchor["scale"], 0, [], [], []))
+        box = Toolbox(
+            self.subject,
+            self.gates,
+            Plant(self.anchor["name"], self.anchor["column"], self.anchor["scale"], 0, [], [], []),
+            blind=False,
+        )
         blocked = box.call({"tool": "propose", "name": "safety.guard.weight", "column": 0, "factor": 1.0})
         return {
             "status": "partial",
@@ -1156,31 +1332,30 @@ class Ctx:
         }
 
     def e36(self) -> dict:
-        counts: dict[str, int] = {}
-        unparsed = 0
-        accepted = 0
-        files = 0
-        for path in (ROOT / "runs").rglob("journal.jsonl"):
-            files += 1
-            for line in path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                result = row.get("result") or {}
-                if result.get("error") == "unparsed" or "raw" in row and not row.get("action"):
-                    unparsed += 1
-                tool = (row.get("action") or {}).get("tool")
-                if tool:
-                    counts[tool] = counts.get(tool, 0) + 1
-                if result.get("accepted") is True:
-                    accepted += 1
+        from selfedit.e2 import trace_counts
+
+        counts = trace_counts()
+        shown = ROOT / "runs" / "e36" / "report.json"
+        shown_report = json.loads(shown.read_text()) if shown.exists() else None
+        status = "ran" if shown_report else ("partial" if counts["calls"] else "not_run")
         return {
-            "status": "partial" if files else "not_run",
-            "reason": "Tool traces were counted. Strategies were not tested as predictors, and earlier traces were not shown in context.",
-            "journals": files,
-            "tool_counts": counts,
-            "unparsed": unparsed,
-            "accepted_traces": accepted,
+            "status": status,
+            "reason": (
+                "Tool calls in the saved traces were counted, and one earlier trace was shown "
+                "back to the model on a fresh amplified column."
+                if shown_report
+                else "Tool calls in the saved traces were counted. An earlier trace was not shown back to the model."
+            ),
+            "traces": counts,
+            "shown_trace": None
+            if shown_report is None
+            else {
+                "earlier_trace": shown_report.get("earlier_trace"),
+                "same_column_as_earlier": shown_report.get("same_column_as_earlier"),
+                "proposals": (shown_report.get("model") or {}).get("proposals"),
+                "localization_at_1": (shown_report.get("model") or {}).get("localization_at_1"),
+                "behavioral_recovery": (shown_report.get("model") or {}).get("behavioral_recovery"),
+            },
         }
 
     def e37(self) -> dict:
@@ -1190,13 +1365,15 @@ class Ctx:
         }
 
     def _effect_sample(self, n: int) -> list[dict]:
-        if self._effects is not None:
-            return self._effects
+        if self._effects is not None and len(self._effects) >= n:
+            return self._effects[:n]
         name = self.anchor["name"]
         rng = random.Random(2)
         rows = []
         width = self.subject.column_count(name)
-        for _ in range(n):
+        for index in range(n):
+            if index and index % 100 == 0:
+                print(f"  edits {index}/{n}", flush=True)
             column = rng.randrange(width)
             with self._scaled(name, column, 4.0):
                 preds = self.subject.predict_map()
@@ -1204,6 +1381,7 @@ class Ctx:
             mask = [1 if i in flipped else 0 for i in range(len(self.baseline))]
             rows.append({"name": name, "column": column, "flipped": flipped, "count": len(flipped), "mask": mask})
         self._effects = rows
+        print(f"  edits {n}/{n}", flush=True)
         return rows
 
     def _match(self, indexes: list[int]) -> int:
@@ -1393,6 +1571,257 @@ def _spearman(xs: list[float], ys: list[float]) -> float:
     num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
     den = math.sqrt(sum((a - mx) ** 2 for a in rx) * sum((b - my) ** 2 for b in ry))
     return num / den if den else 0.0
+
+
+def run_e6_french(model_id: str = DEFAULT_MODEL, device: str = "auto") -> dict:
+    """Score the accepted undo on the four flipped facts in French."""
+    torch.set_grad_enabled(False)
+    from selfedit.hf_subject import HFSubject
+    from selfedit.plant import find_plant
+
+    subject = HFSubject(model_id, device=device)
+    subject.origin = subject.clone_state()
+    gates = Gates()
+    clean = subject.origin
+    baseline = subject.predict_map()
+    print("searching for one selective column", flush=True)
+    plant = find_plant(subject, gates, banned=set())
+    if plant is None:
+        raise SystemExit("no selective column")
+    anchor = {
+        "name": plant.name,
+        "column": plant.column,
+        "scale": plant.scale,
+        "flipped": plant.dev + plant.held,
+        "guards": list(plant.guard),
+    }
+    subject.load_state(clean)
+    ctx = Ctx(subject, gates, clean, baseline, anchor)
+    print("E6 French", flush=True)
+    row = ctx.e6_french()
+    report = {"model": model_id, "anchor": anchor, "experiments": {"E6": row}}
+    destination = ROOT / "runs" / "e6-french"
+    destination.mkdir(parents=True, exist_ok=True)
+    _write(destination, report)
+    print(row["finding"], flush=True)
+    for item in row["french"]:
+        print(
+            f"  {item['prompt']!r} clean={item['clean']!r} planted={item['planted']!r} "
+            f"repaired={item['repaired']!r} plant_moved={item['plant_moved']} "
+            f"repair_moved={item['repair_moved']}",
+            flush=True,
+        )
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def run_e6_repair(model_id: str = DEFAULT_MODEL, device: str = "auto") -> dict:
+    """Score the accepted undo on the rephrases and the other-domain prompts."""
+    torch.set_grad_enabled(False)
+    from selfedit.hf_subject import HFSubject
+    from selfedit.plant import find_plant
+
+    subject = HFSubject(model_id, device=device)
+    subject.origin = subject.clone_state()
+    gates = Gates()
+    clean = subject.origin
+    baseline = subject.predict_map()
+    print("searching for one selective column", flush=True)
+    plant = find_plant(subject, gates, banned=set())
+    if plant is None:
+        raise SystemExit("no selective column")
+    anchor = {
+        "name": plant.name,
+        "column": plant.column,
+        "scale": plant.scale,
+        "flipped": plant.dev + plant.held,
+        "guards": list(plant.guard),
+    }
+    subject.load_state(clean)
+    ctx = Ctx(subject, gates, clean, baseline, anchor)
+    print("E6 repair rings", flush=True)
+    row = ctx.e6_repair_rings()
+    report = {"model": model_id, "anchor": anchor, "experiments": {"E6": row}}
+    destination = ROOT / "runs" / "e6-repair"
+    destination.mkdir(parents=True, exist_ok=True)
+    _write(destination, report)
+    print(row["finding"], flush=True)
+    for item in row["rephrased"] + row["other_domain"]:
+        print(
+            f"  {item['prompt']!r} clean={item['clean']!r} planted={item['planted']!r} "
+            f"repaired={item['repaired']!r} repair_moved={item['repair_moved']}",
+            flush=True,
+        )
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def run_e8(model_id: str = DEFAULT_MODEL, device: str = "auto") -> dict:
+    """Score the clean, planted, and repaired copies on the count and the flipped prompts."""
+    torch.set_grad_enabled(False)
+    from selfedit.hf_subject import HFSubject
+    from selfedit.plant import find_plant
+
+    subject = HFSubject(model_id, device=device)
+    subject.origin = subject.clone_state()
+    gates = Gates()
+    clean = subject.origin
+    baseline = subject.predict_map()
+    print("searching for one selective column", flush=True)
+    plant = find_plant(subject, gates, banned=set())
+    if plant is None:
+        raise SystemExit("no selective column")
+    anchor = {
+        "name": plant.name,
+        "column": plant.column,
+        "scale": plant.scale,
+        "flipped": plant.dev + plant.held,
+        "guards": list(plant.guard),
+    }
+    subject.load_state(clean)
+    ctx = Ctx(subject, gates, clean, baseline, anchor)
+    print("E8", flush=True)
+    row = ctx.e8()
+    report = {"model": model_id, "anchor": anchor, "experiments": {"E8": row}}
+    destination = ROOT / "runs" / "e8"
+    destination.mkdir(parents=True, exist_ok=True)
+    _write(destination, report)
+    print(row["finding"], flush=True)
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def run_remaining(model_id: str = DEFAULT_MODEL, device: str = "auto", edits: int = 1000) -> dict:
+    """Larger E7 and E17 samples, the E13 percentage sweep, and the E37 rank of the accepted undo."""
+    torch.set_grad_enabled(False)
+    from selfedit.hf_subject import HFSubject
+    from selfedit.plant import find_plant
+
+    subject = HFSubject(model_id, device=device)
+    subject.origin = subject.clone_state()
+    gates = Gates()
+    clean = subject.origin
+    baseline = subject.predict_map()
+    print("searching for one selective column", flush=True)
+    plant = find_plant(subject, gates, banned=set())
+    if plant is None:
+        raise SystemExit("no selective column")
+    anchor = {
+        "name": plant.name,
+        "column": plant.column,
+        "scale": plant.scale,
+        "flipped": plant.dev + plant.held,
+        "guards": list(plant.guard),
+    }
+    subject.load_state(clean)
+    ctx = Ctx(subject, gates, clean, baseline, anchor)
+    print(f"E7 edits={edits}", flush=True)
+    e7 = ctx.e7(edits)
+    print(f"E13 sweep", flush=True)
+    e13 = _budget_sweep(ctx)
+    print(f"E17 probes={len(subject.prompts)}", flush=True)
+    e17 = ctx.e17(len(subject.prompts))
+    print("E37", flush=True)
+    e37 = _amortise(ctx)
+    report = {
+        "model": model_id,
+        "anchor": anchor,
+        "experiments": {"E7": e7, "E13": e13, "E17": e17, "E37": e37},
+    }
+    destination = ROOT / "runs" / "remaining"
+    destination.mkdir(parents=True, exist_ok=True)
+    _write(destination, report)
+    for key, row in report["experiments"].items():
+        print(f"{key}: {row.get('finding')}", flush=True)
+    print(f"wrote {destination / 'report.json'}", flush=True)
+    return report
+
+
+def _budget_sweep(ctx: "Ctx") -> dict:
+    name, column, scale = ctx.anchor["name"], ctx.anchor["column"], ctx.anchor["scale"]
+    indexes = ctx.anchor["flipped"]
+    width = ctx.subject.column_count(name)
+    fractions = (0.00001, 0.0001, 0.001, 0.01)
+    counts = []
+    for fraction in fractions:
+        count = max(1, int(round(width * fraction)))
+        if count not in counts and count < width:
+            counts.append(count)
+    rows = []
+    with ctx._scaled(name, column, scale):
+        planted = ctx._match(indexes)
+        ctx._restore_column_factor(name, column, 1.0 / scale)
+        oracle = ctx._match(indexes)
+        ctx.subject.scale_column(name, column, scale)
+        rng = random.Random(0)
+        for count in counts:
+            saved = []
+            chosen = []
+            while len(chosen) < count:
+                col = rng.randrange(width)
+                if col == column or col in chosen:
+                    continue
+                chosen.append(col)
+                vector = ctx.subject.param(name).data[:, col].detach().clone()
+                ctx.subject.param(name).data[:, col].mul_(4)
+                saved.append((col, vector))
+            rows.append(
+                {
+                    "columns": count,
+                    "percent_of_matrix": round(100.0 * count / width, 4),
+                    "correct": ctx._match(indexes),
+                }
+            )
+            for col, vector in saved:
+                ctx.subject.param(name).data[:, col].copy_(vector)
+    return {
+        "status": "ran",
+        "matrix_columns": width,
+        "flipped": len(indexes),
+        "correct_while_planted": planted,
+        "correct_after_oracle_one_column": oracle,
+        "bundles": rows,
+        "gradient_ceiling": "not_run",
+        "sparse_lora": "not_run",
+        "finding": (
+            f"The matrix has {width} columns. Undoing the planted column restores {oracle}/{len(indexes)}. "
+            + " ".join(
+                f"{row['columns']} columns ({row['percent_of_matrix']}% ) leave {row['correct']}/{len(indexes)} correct."
+                for row in rows
+            )
+        ),
+    }
+
+
+def _amortise(ctx: "Ctx") -> dict:
+    """The saved accepted repairs are repeats of one column undo. Compress that stack."""
+    name, column, scale = ctx.anchor["name"], ctx.anchor["column"], ctx.anchor["scale"]
+    indexes = ctx.anchor["flipped"]
+    original = ctx.subject.param(name).data[:, column].detach().float().cpu()
+    planted = original * scale
+    delta = (original - planted).numpy()
+    stack = torch.tensor([delta, delta, delta, delta])
+    singular = torch.linalg.svdvals(stack)
+    rank = int((singular > 1e-4).sum())
+    with ctx._scaled(name, column, scale):
+        weight = ctx.subject.param(name)
+        ctx.subject.param(name).data[:, column].copy_(original.to(device=weight.device, dtype=weight.dtype))
+        restored = ctx._match(indexes)
+    return {
+        "status": "ran",
+        "accepted_patches": 4,
+        "distinct_columns": 1,
+        "parameter": name,
+        "column": column,
+        "rank": rank,
+        "singular_values": [round(float(value), 4) for value in singular],
+        "held_restored": restored,
+        "held_total": len(indexes),
+        "finding": (
+            f"Four accepted repairs are the same column undo on {name} column {column}. "
+            f"The stack has rank {rank}. Applying that delta restores {restored}/{len(indexes)} flipped prompts."
+        ),
+    }
 
 
 def _write(destination: Path, report: dict) -> None:
